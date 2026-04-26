@@ -1,0 +1,779 @@
+name: pipeline-d
+description: |
+  Pipeline D - PRD maker + builder + reviewer for all 6 build modes.
+
+  DEFAULTS:
+    PRD:    opus-4.7-medium
+    Build:  sonnet-4.6
+    Review: opus-4.7-extrahigh
+
+  REQUIRED on line 1+ of input:
+    @type <build-type>
+      one of: standalone-app, module, module-host, assembly, feature-add, contract-spec
+      MISSING OR INVALID = preflight fails fast.
+
+  OPTIONAL on line 1+ of input:
+    @mode <mode>           full | prd-only | build-only       (default: full)
+    @model-prd <name>      override PRD model                 (default: opus-4.7-medium)
+    @model-build <name>    override Build model               (default: sonnet-4.6)
+    @model-review <name>   override Review model              (default: opus-4.7-extrahigh)
+
+    Allowed model names:
+      opus-4.6-medium, opus-4.6-high, opus-4.6-extrahigh,
+      opus-4.7-medium, opus-4.7-high, opus-4.7-extrahigh,
+      sonnet-4.6
+
+    For mode=build-only, supply absolute path to existing PRD bundle dir
+    on its own line after the tags.
+
+  EXAMPLE:
+    @type module
+    @mode full
+
+    Build me an MP3 generator that converts CSV rows into audio files.
+
+  All three preflight announcements appear FIRST in the run side-panel.
+  Override values are visible there before any heavy model spend.
+
+nodes:
+
+  # ============================================================
+  # LAYER 0 - PREFLIGHTS (parallel, haiku, fail-fast on @type)
+  # ============================================================
+
+  - id: model-select
+    prompt: |
+      Parse three optional tags from the user input. Each tag must appear on its
+      own line at the very top of the input, before any prose.
+
+      Input message:
+      ---
+      $ARGUMENTS
+      ---
+
+      Tags to look for (any subset, in any order):
+        @model-prd <name>
+        @model-build <name>
+        @model-review <name>
+
+      Allowed names and their Archon mappings:
+        opus-4.6-medium    -> model=claude-opus-4-6,    effort=medium
+        opus-4.6-high      -> model=claude-opus-4-6,    effort=high
+        opus-4.6-extrahigh -> model=claude-opus-4-6,    effort=max
+        opus-4.7-medium    -> model=claude-opus-4-7,    effort=medium
+        opus-4.7-high      -> model=claude-opus-4-7,    effort=high
+        opus-4.7-extrahigh -> model=claude-opus-4-7,    effort=max
+        sonnet-4.6         -> model=claude-sonnet-4-6,  effort=medium
+
+      Defaults when a tag is absent:
+        @model-prd     -> opus-4.7-medium
+        @model-build   -> sonnet-4.6
+        @model-review  -> opus-4.7-extrahigh
+
+      Validation:
+        - If a tag is present with a name NOT in the allowed list, set valid=false
+          and put a clear error in announcement. Do NOT silently fall back.
+        - If all tags are absent or all present with valid names, set valid=true.
+
+      Emit JSON only with the fields in the schema. The announcement field is
+      one human-readable line shown FIRST in the Archon side-panel. Format:
+        "Models: prd=<name>, build=<name>, review=<name>"
+      or on validation error:
+        "FAIL: unknown model '<name>' for @model-<spot>. Allowed: <list>"
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        valid:
+          type: string
+          enum: ["true", "false"]
+        model_prd:
+          type: string
+        effort_prd:
+          type: string
+        model_build:
+          type: string
+        effort_build:
+          type: string
+        model_review:
+          type: string
+        effort_review:
+          type: string
+        announcement:
+          type: string
+      required: [valid, model_prd, effort_prd, model_build, effort_build, model_review, effort_review, announcement]
+
+  - id: mode-select
+    prompt: |
+      Parse the optional @mode tag from the user input. Tag must appear on its
+      own line at the top of the input, before any prose.
+
+      Input message:
+      ---
+      $ARGUMENTS
+      ---
+
+      Allowed values for @mode:
+        full        -> run PRD stages + build phases + final review
+        prd-only    -> run PRD stages only, stop at prd-bundle-ready
+        build-only  -> skip PRD stages, run import-bundle + build phases + final review
+
+      Default when tag absent: full
+
+      For mode=build-only, the user MUST also supply an absolute path to an
+      existing PRD bundle directory on its own line. Find it (look for a path
+      that exists on Windows, e.g. starts with C:\\ or /c/). If mode is
+      build-only and no bundle path is parseable, set valid=false and put a
+      clear error in announcement.
+
+      Derived booleans:
+        prd_runs_raw   = "true" if mode is full OR prd-only, else "false"
+        build_runs_raw = "true" if mode is full OR build-only, else "false"
+
+      Emit JSON only. The announcement field is one human-readable line shown
+      in the Archon side-panel. Format:
+        "Mode: <mode>"
+      or for build-only:
+        "Mode: build-only (bundle: <path>)"
+      or on error:
+        "FAIL: build-only requires a bundle path on its own line."
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        valid:
+          type: string
+          enum: ["true", "false"]
+        mode:
+          type: string
+          enum: [full, prd-only, build-only]
+        prd_runs_raw:
+          type: string
+          enum: ["true", "false"]
+        build_runs_raw:
+          type: string
+          enum: ["true", "false"]
+        bundle_path:
+          type: string
+        announcement:
+          type: string
+      required: [valid, mode, prd_runs_raw, build_runs_raw, bundle_path, announcement]
+
+  - id: build-type-select
+    prompt: |
+      Parse the REQUIRED @type tag from the user input. Tag must appear on its
+      own line at the top of the input, before any prose.
+
+      Input message:
+      ---
+      $ARGUMENTS
+      ---
+
+      Allowed values for @type:
+        standalone-app, module, module-host, assembly, feature-add, contract-spec
+
+      This tag is REQUIRED. Fail fast if missing or unrecognized:
+        - If the tag is absent, set valid=false and put this in announcement:
+            "FAIL: @type tag is required. One of: standalone-app, module,
+             module-host, assembly, feature-add, contract-spec"
+        - If the value is not in the allowed list, set valid=false and put
+          the clear error message in announcement.
+        - On success, set valid=true and announcement to:
+            "Build type: <value>"
+
+      Emit JSON only.
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        valid:
+          type: string
+          enum: ["true", "false"]
+        build_type:
+          type: string
+        announcement:
+          type: string
+      required: [valid, build_type, announcement]
+
+  # ============================================================
+  # LAYER 1 - DISPATCHER
+  # Combines all three preflight validity checks with mode-derived
+  # booleans into single-boolean gates so downstream when: clauses
+  # do not need || (Archon when: only supports == and !=).
+  # ============================================================
+
+  - id: dispatcher
+    prompt: |
+      Combine the three preflight outputs and emit downstream gating booleans.
+
+      Inputs:
+        model-select.valid       = $model-select.output.valid
+        mode-select.valid        = $mode-select.output.valid
+        build-type-select.valid  = $build-type-select.output.valid
+        mode-select.prd_runs_raw   = $mode-select.output.prd_runs_raw
+        mode-select.build_runs_raw = $mode-select.output.build_runs_raw
+
+      Compute:
+        all_valid        = "true" if every preflight valid is "true", else "false"
+        prd_runs_ok      = "true" if all_valid AND prd_runs_raw, else "false"
+        build_runs_ok    = "true" if all_valid AND build_runs_raw, else "false"
+        is_build_only    = "true" if all_valid AND mode is build-only, else "false"
+
+      Pass through:
+        bundle_path = $mode-select.output.bundle_path
+        build_type  = $build-type-select.output.build_type
+
+      The announcement field summarizes for the side-panel:
+        "Dispatch: prd_runs=<bool>, build_runs=<bool>, type=<build_type>"
+        or if any preflight failed:
+        "FAIL: dispatcher halted - see preflight announcements above."
+
+      Emit JSON only.
+    depends_on: [model-select, mode-select, build-type-select]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        all_valid:
+          type: string
+          enum: ["true", "false"]
+        prd_runs_ok:
+          type: string
+          enum: ["true", "false"]
+        build_runs_ok:
+          type: string
+          enum: ["true", "false"]
+        is_build_only:
+          type: string
+          enum: ["true", "false"]
+        bundle_path:
+          type: string
+        build_type:
+          type: string
+        announcement:
+          type: string
+      required: [all_valid, prd_runs_ok, build_runs_ok, is_build_only, bundle_path, build_type, announcement]
+
+  # ============================================================
+  # LAYER 2 - BUILD-ONLY ENTRY
+  # Reads bundle from supplied path into $ARTIFACTS_DIR/bundle/.
+  # Skipped unless mode is build-only.
+  # ============================================================
+
+  - id: import-bundle
+    prompt: |
+      Mode is build-only. Stage the supplied PRD bundle into the artifacts dir
+      so the build phases can consume it.
+
+      Source bundle path: $dispatcher.output.bundle_path
+      Destination:        $ARTIFACTS_DIR/bundle/
+
+      Steps:
+        1. Use Glob to enumerate every file under the source bundle path.
+        2. Use Read to load each file.
+        3. Use Write to create the same file under the destination, preserving
+           subdirectory structure. Create intermediate directories implicitly
+           via Write paths.
+        4. Verify file count matches.
+
+      Do NOT use a shell. Do NOT use Bash. File ops only.
+
+      Emit JSON with status READY on success, FAIL with reason otherwise.
+    depends_on: [dispatcher]
+    when: '$dispatcher.output.is_build_only == "true"'
+    allowed_tools: [Read, Write, Edit, Glob]
+    model: haiku
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [READY, FAIL]
+        files_copied:
+          type: string
+        bundle_path:
+          type: string
+        reason:
+          type: string
+      required: [status, files_copied, bundle_path, reason]
+
+  # ============================================================
+  # LAYER 3 - PRD PHASE
+  # 11 stages: 00, 01, 02, 03, 04, 05, 07, 08, 09, 10, 10-v2
+  # Each is a prompt: node that injects BUILD_TYPE then directs the
+  # AI to Read the matching .archon/commands/prd-stage-NN.md and
+  # follow it, substituting $BUILD_TYPE inline. (Archon command: nodes
+  # cannot pass node-output values into the command file, so we wrap
+  # the command read in a prompt node instead. Pass 0 stage files
+  # remain unmodified.)
+  # ============================================================
+
+  - id: stage-00
+    prompt: |
+      You are running the Archon PRD pipeline, stage 00.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Use Read to load the file at:
+           .archon/commands/prd-stage-00.md
+      2. Treat its contents as your full instructions for this stage.
+      3. Wherever the file references the variable $BUILD_TYPE, substitute it
+         literally with: $dispatcher.output.build_type
+         (so e.g. `IF $BUILD_TYPE == "module"` becomes
+          `IF "$dispatcher.output.build_type" == "module"`).
+      4. The user's original input message (for stage 00 intake) is:
+         ---
+         $ARGUMENTS
+         ---
+      5. Execute the stage exactly as the file directs. Write outputs to
+         $ARTIFACTS_DIR per the file's instructions.
+    depends_on: [dispatcher]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-01
+    prompt: |
+      Stage 01 of the PRD pipeline.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Use Read to load: .archon/commands/prd-stage-01.md
+      2. Treat its contents as your full instructions.
+      3. Wherever the file references $BUILD_TYPE, substitute it with:
+         $dispatcher.output.build_type
+      4. Read prior-stage outputs from $ARTIFACTS_DIR as the file directs.
+      5. Execute the stage. Write outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-00]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-02
+    prompt: |
+      Stage 02 of the PRD pipeline.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-02.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-01]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-03
+    prompt: |
+      Stage 03 of the PRD pipeline.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-03.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-02]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-04
+    prompt: |
+      Stage 04 of the PRD pipeline (Mechanism Extraction).
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-04.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+         The file's preamble has 6 mode branches plus a contract-spec scoring
+         override at Step 3. The substituted value picks which branch applies.
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-03]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-05
+    prompt: |
+      Stage 05 of the PRD pipeline.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-05.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-04]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-07
+    prompt: |
+      Stage 07 of the PRD pipeline (Phase Sequencing).
+      Note: there is no stage-06 in this pipeline.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-07.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+         The file's Step 4 has a contract-spec sandbox override.
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-05]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-08
+    prompt: |
+      Stage 08 of the PRD pipeline.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-08.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-07]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-09
+    prompt: |
+      Stage 09 of the PRD pipeline.
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-09.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+    depends_on: [stage-08]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-10
+    prompt: |
+      Stage 10 of the PRD pipeline (Output Generator v1).
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-10.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write this stage's outputs to $ARTIFACTS_DIR.
+
+      Stage 10-v2 runs after this and supersedes the phase-file output for
+      runtime modes. Treat this stage as the v1 deliverable producer; it
+      remains in the chain for backwards compatibility.
+    depends_on: [stage-09]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  - id: stage-10-v2
+    prompt: |
+      Stage 10-v2 of the PRD pipeline (Output Generator v2 with mandatory
+      compliance contract block per phase file).
+
+      BUILD_TYPE = $dispatcher.output.build_type
+
+      1. Read .archon/commands/prd-stage-10-v2.md and follow its instructions.
+      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
+         The file branches per build_type for which deliverables to emit.
+      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
+      4. Write the final deliverable set to $ARTIFACTS_DIR per the file's
+         per-mode instructions. For runtime modes (standalone-app, module,
+         module-host, assembly, feature-add), each phase file MUST contain
+         the mandatory compliance contract block verbatim.
+    depends_on: [stage-10]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: '$model-select.output.model_prd'
+    effort: '$model-select.output.effort_prd'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+
+  # ============================================================
+  # LAYER 4 - PRD/BUILD SEAM
+  # ============================================================
+
+  - id: prd-bundle-ready
+    prompt: |
+      The PRD half completed for build_type = $dispatcher.output.build_type.
+
+      Confirm the deliverables exist under $ARTIFACTS_DIR. The exact set
+      depends on build_type per stage-10-v2's per-mode rules:
+        standalone-app / module-host -> phases/, build.sh, CLAUDE.md, BUILD_RULES.md, README.md, .gitignore, .env.example
+        module                       -> standalone set + module.yaml
+        assembly                     -> phases/, build.sh, INTEGRATION_NOTES.md
+        feature-add                  -> phases/, FEATURE_NOTES.md
+        contract-spec                -> SCHEMA.sql, MODULE_CONTRACTS.md, EVENT_BUS.md, WIRE_UP_MAP.md, SHARED_ENV.md
+
+      Use Glob to verify the expected files exist for the current build_type.
+
+      Emit JSON:
+        status   = READY if all expected files present, FAIL otherwise
+        bundle_path = $ARTIFACTS_DIR
+        manifest = brief comma-separated list of top-level deliverables found
+    depends_on: [stage-10-v2]
+    when: '$dispatcher.output.prd_runs_ok == "true"'
+    model: haiku
+    allowed_tools: [Read, Glob]
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [READY, FAIL]
+        bundle_path:
+          type: string
+        manifest:
+          type: string
+      required: [status, bundle_path, manifest]
+
+  # ============================================================
+  # LAYER 5 - BUILD PHASES
+  # 3 phases hardcoded per Known Issue #4 (matches pipeline-c).
+  # Each phase reads its phase-N.md from the bundle and builds.
+  # Compliance gate after each phase.
+  # phase-1 fans in from prd-bundle-ready (full mode) or
+  # import-bundle (build-only mode). trigger_rule lets either path
+  # satisfy the dependency without requiring both.
+  # ============================================================
+
+  - id: phase-1
+    prompt: |
+      Build phase 1 for this PRD.
+
+      build_type = $dispatcher.output.build_type
+
+      For contract-spec mode there are no phase files; this node should detect
+      that condition early, confirm the contract-spec deliverables exist under
+      $ARTIFACTS_DIR (or $ARTIFACTS_DIR/bundle/ for build-only mode), and emit
+      status=NOOP_CONTRACT_SPEC.
+
+      For all runtime modes:
+        1. Locate the bundle root:
+             - if $ARTIFACTS_DIR/bundle/ exists -> use it (build-only path)
+             - else use $ARTIFACTS_DIR (full path)
+        2. Read phases/phase-1.md from the bundle.
+        3. Implement every file in its build_order, respecting files_allowed,
+           files_read_only, files_forbidden.
+        4. Run the verification checks the phase file specifies.
+        5. Address every issue per the mandatory compliance contract block.
+
+      Emit JSON status PASS/FAIL with a one-line summary.
+    depends_on: [prd-bundle-ready, import-bundle]
+    trigger_rule: none_failed_min_one_success
+    when: '$dispatcher.output.build_runs_ok == "true"'
+    model: '$model-select.output.model_build'
+    effort: '$model-select.output.effort_build'
+    allowed_tools: [Read, Write, Edit, Glob, Grep, Bash]
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [PASS, FAIL, NOOP_CONTRACT_SPEC]
+        summary:
+          type: string
+      required: [status, summary]
+
+  - id: gate-phase-1
+    prompt: |
+      Compliance gate for phase 1.
+
+      phase-1 reported: $phase-1.output.status
+      Summary: $phase-1.output.summary
+
+      Decide:
+        - phase-1 status PASS              -> emit status=PASS
+        - phase-1 status NOOP_CONTRACT_SPEC -> emit status=PASS (skip later phases)
+        - phase-1 status FAIL              -> emit status=FAIL with reason
+
+      Emit JSON only.
+    depends_on: [phase-1]
+    when: '$dispatcher.output.build_runs_ok == "true"'
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [PASS, FAIL]
+        reason:
+          type: string
+      required: [status, reason]
+
+  - id: phase-2
+    prompt: |
+      Build phase 2 for this PRD.
+
+      build_type = $dispatcher.output.build_type
+      phase-1 outcome: $phase-1.output.status
+
+      If phase-1 emitted NOOP_CONTRACT_SPEC, this node should also emit
+      NOOP_CONTRACT_SPEC and do nothing else. (contract-spec runs have no
+      multi-phase build.)
+
+      Otherwise:
+        1. Locate the bundle root (same logic as phase-1).
+        2. Read phases/phase-2.md if it exists. If the PRD only produced one
+           phase (e.g., module mode often has 1-3 phases total), emit
+           status=PASS with summary="phase 2 not produced; only $N$ phases in
+           PRD" and do nothing.
+        3. Implement every file in its build_order respecting the sandbox.
+        4. Run verification checks.
+        5. Address issues per the mandatory compliance contract block.
+    depends_on: [gate-phase-1]
+    when: '$gate-phase-1.output.status == "PASS"'
+    model: '$model-select.output.model_build'
+    effort: '$model-select.output.effort_build'
+    allowed_tools: [Read, Write, Edit, Glob, Grep, Bash]
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [PASS, FAIL, NOOP_CONTRACT_SPEC]
+        summary:
+          type: string
+      required: [status, summary]
+
+  - id: gate-phase-2
+    prompt: |
+      Compliance gate for phase 2.
+
+      phase-2 reported: $phase-2.output.status
+      Summary: $phase-2.output.summary
+
+      Decide PASS / FAIL using the same rules as gate-phase-1.
+    depends_on: [phase-2]
+    when: '$dispatcher.output.build_runs_ok == "true"'
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [PASS, FAIL]
+        reason:
+          type: string
+      required: [status, reason]
+
+  - id: phase-3
+    prompt: |
+      Build phase 3 for this PRD.
+
+      build_type = $dispatcher.output.build_type
+      phase-1 outcome: $phase-1.output.status
+
+      If phase-1 emitted NOOP_CONTRACT_SPEC, emit NOOP_CONTRACT_SPEC.
+
+      Otherwise:
+        1. Locate the bundle root.
+        2. Read phases/phase-3.md if it exists. If the PRD produced fewer
+           than 3 phases, emit status=PASS with summary="phase 3 not produced".
+        3. Implement, verify, comply with the contract block.
+    depends_on: [gate-phase-2]
+    when: '$gate-phase-2.output.status == "PASS"'
+    model: '$model-select.output.model_build'
+    effort: '$model-select.output.effort_build'
+    allowed_tools: [Read, Write, Edit, Glob, Grep, Bash]
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [PASS, FAIL, NOOP_CONTRACT_SPEC]
+        summary:
+          type: string
+      required: [status, summary]
+
+  - id: gate-phase-3
+    prompt: |
+      Compliance gate for phase 3.
+
+      phase-3 reported: $phase-3.output.status
+      Summary: $phase-3.output.summary
+
+      Decide PASS / FAIL using the same rules as the prior two gates.
+    depends_on: [phase-3]
+    when: '$dispatcher.output.build_runs_ok == "true"'
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [PASS, FAIL]
+        reason:
+          type: string
+      required: [status, reason]
+
+  # ============================================================
+  # LAYER 6 - FINAL REVIEWER
+  # Single high-effort node; default opus-4.7-extrahigh.
+  # ============================================================
+
+  - id: final-review
+    prompt: |
+      Final reviewer. Read the build output under the bundle root (either
+      $ARTIFACTS_DIR/bundle/ for build-only mode, or $ARTIFACTS_DIR for full
+      mode) and the per-phase build summaries:
+
+        phase-1 summary: $phase-1.output.summary
+        phase-2 summary: $phase-2.output.summary
+        phase-3 summary: $phase-3.output.summary
+
+      build_type = $dispatcher.output.build_type
+
+      Produce a final review report at $ARTIFACTS_DIR/final-review.md covering:
+        - Did each phase actually deliver what its phase file specified?
+        - Are there compliance contract block violations (exemption language,
+          deferred items beyond the 5-item cap, untested WALL steps)?
+        - For runtime modes: do the produced files form a runnable artifact?
+        - For contract-spec: do all contract documents have a "Schema
+          Compliance" section?
+        - Top 5 highest-priority issues to fix before shipping.
+
+      Emit JSON with overall verdict SHIP / NEEDS_FIXES / BROKEN and the
+      report path.
+    depends_on: [gate-phase-3]
+    when: '$gate-phase-3.output.status == "PASS"'
+    model: '$model-select.output.model_review'
+    effort: '$model-select.output.effort_review'
+    allowed_tools: [Read, Write, Edit, Glob, Grep]
+    output_format:
+      type: object
+      properties:
+        verdict:
+          type: string
+          enum: [SHIP, NEEDS_FIXES, BROKEN]
+        report_path:
+          type: string
+        top_issues:
+          type: string
+      required: [verdict, report_path, top_issues]
