@@ -50,6 +50,17 @@ Extract each distinct functional mechanism (or contract entity, per your preambl
 
 ### Step 3: Evaluate NEEDS_EVALUATION Mechanisms
 
+**IF `$BUILD_TYPE == "contract-spec"`:** Use a REDUCED 5-axis rubric instead of the full 10-axis:
+1. Data Integrity Risk (1-5)
+2. Migration Complexity (1-5)
+3. Query Performance Impact (1-5)
+4. Schema Evolution Cost (1-5)
+5. Cross-Module Coupling (1-5)
+
+Skip all UX, Time-to-Implement, Cost-of-Build, and runtime axes. Score only the 5 axes above.
+
+**ELSE:** Use the full 10-axis rubric below.
+
 For each, define 2-3 competing approaches. Score each 0-100 across:
 - Technical Complexity, Scalability, Maintainability, Performance, Security
 - UX Impact, Cost, Time to Implement, Ecosystem Fit, Future Flexibility

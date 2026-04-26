@@ -60,6 +60,15 @@ Topological sort by mechanism dependencies. Walk the graph and accumulate tokens
 
 ### Step 4: Assign File Sandboxes Per Phase
 
+**IF `$BUILD_TYPE == "contract-spec"`:** Skip file sandbox tiers entirely. Output a single phase with:
+- `layer: "schema_only"`
+- `files_allowed`: list the contract files to emit (e.g., `SCHEMA.sql`, `MODULE_CONTRACTS.md`, `EVENT_BUS.md`)
+- `files_forbidden`: `["**/*.ts", "**/*.tsx", "**/*.py", "**/*.js"]` (anything code-shaped)
+
+Do NOT produce multi-phase code build orders.
+
+**ELSE:** Use the standard sandbox tiers below.
+
 Three tiers per phase:
 - `files_allowed`: Files this phase creates or modifies
 - `files_read_only`: Files this phase can reference but not change (includes inherited files for assembly / feature-add / module modes)
