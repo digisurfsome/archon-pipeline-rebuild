@@ -471,30 +471,11 @@ nodes:
     effort: '$model-select.output.effort_prd'
     allowed_tools: [Read, Write, Edit, Glob, Grep]
 
-  - id: stage-10
-    prompt: |
-      Stage 10 of the PRD pipeline (Output Generator v1).
-
-      BUILD_TYPE = $dispatcher.output.build_type
-
-      1. Read .archon/commands/prd-stage-10.md and follow its instructions.
-      2. Substitute $BUILD_TYPE inline with: $dispatcher.output.build_type
-      3. Consume prior-stage artifacts from $ARTIFACTS_DIR.
-      4. Write this stage's outputs to $ARTIFACTS_DIR.
-
-      Stage 10-v2 runs after this and supersedes the phase-file output for
-      runtime modes. Treat this stage as the v1 deliverable producer; it
-      remains in the chain for backwards compatibility.
-    depends_on: [stage-09]
-    when: '$dispatcher.output.prd_runs_ok == "true"'
-    model: '$model-select.output.model_prd'
-    effort: '$model-select.output.effort_prd'
-    allowed_tools: [Read, Write, Edit, Glob, Grep]
-
   - id: stage-10-v2
     prompt: |
       Stage 10-v2 of the PRD pipeline (Output Generator v2 with mandatory
-      compliance contract block per phase file).
+      compliance contract block per phase file). This is the FINAL PRD
+      producer node; stage-10 (v1) is no longer in the chain.
 
       BUILD_TYPE = $dispatcher.output.build_type
 
@@ -506,7 +487,7 @@ nodes:
          per-mode instructions. For runtime modes (standalone-app, module,
          module-host, assembly, feature-add), each phase file MUST contain
          the mandatory compliance contract block verbatim.
-    depends_on: [stage-10]
+    depends_on: [stage-09]
     when: '$dispatcher.output.prd_runs_ok == "true"'
     model: '$model-select.output.model_prd'
     effort: '$model-select.output.effort_prd'
